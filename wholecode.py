@@ -30,15 +30,19 @@ CACHE_DIR = f"{PLOT_DIR}/Cache"
 os.makedirs(PLOT_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Update these based on your system configuration
+BASE_GC_DIR = "/media/airlab/ROCSTOR/graphcast/Climatology_final"
+
 PATHS = {
     "IMERG": "/home/airlab/Documents/airlab/weathernext_analysis/imerg_regrid_2021_2024.zarr",
     "GC_RAIN": "/home/airlab/Documents/airlab/weathernext_analysis/daily_rain_all_leads_2021_2024.zarr",
-    "ERA5_T2M": "/media/airlab/ROCSTOR/graphcast/Climatology_final/era5_t2m_2021_2024.zarr",
-    "ERA5_WIND": "/media/airlab/ROCSTOR/graphcast/Climatology_final/era5_10m_wind_2021_2024.zarr",
-    "GC_T2M": "/media/airlab/ROCSTOR/graphcast/Climatology_final/gc_t2m_all_leads_2021_2024.zarr",
-    "GC_WIND": "/media/airlab/ROCSTOR/graphcast/Climatology_final/gc_10m_wind_all_leads_2021_2024.zarr"
+    "ERA5_T2M": f"{BASE_GC_DIR}/daily_t2m_ERA5_global_2021_2024.zarr",
+    "ERA5_U10": f"{BASE_GC_DIR}/daily_u10_ERA5_global_2021_2024.zarr",
+    "ERA5_V10": f"{BASE_GC_DIR}/daily_v10_ERA5_global_2021_2024.zarr",
 }
+
+# GraphCast paths are split by lead time for these surface variables
+def get_gc_path(var_name, lead):
+    return f"{BASE_GC_DIR}/daily_{var_name}_{lead}hr_2021_2024_clean.zarr"
 
 GC_LEADS = [24, 48, 72]
 
@@ -91,30 +95,34 @@ def nc_exists(name):
 # ══════════════════════════════════════════════════════════════════════════════
 # DATA LOADERS
 # ══════════════════════════════════════════════════════════════════════════════
+def get_first_var(ds):
+    """Returns the first data variable in the dataset to avoid hardcoding names."""
+    var_name = list(ds.data_vars)[0]
+    return ds[var_name]
+
 def get_gc_var(ds, lead, base_var):
     """Robust extraction of lead time variable from a combined Zarr."""
     if "lead" in ds.dims or "lead" in ds.coords:
-        # e.g., lead defined as timedelta or integer
         try:
             return ds.sel(lead=lead)[base_var]
         except KeyError:
-            # Maybe lead is a timedelta64 format
             lead_td = np.timedelta64(lead, 'h')
             return ds.sel(lead=lead_td)[base_var]
     elif f"{base_var}_{lead}hr" in ds.data_vars:
         return ds[f"{base_var}_{lead}hr"]
     else:
-        # Fallback assuming single-variable dataset loaded dynamically
         return ds[base_var]
 
 print("\nLoading datasets ...")
+
 # 1. Rainfall
 try:
-    imrg = xr.open_zarr(PATHS["IMERG"])["daily_rain"]
+    imrg = xr.open_zarr(PATHS["IMERG"])
+    imrg_var = get_first_var(imrg)
     gc_rain_ds = xr.open_zarr(PATHS["GC_RAIN"])
-    ds_rain = {"OBS": imrg}
+    ds_rain = {"OBS": imrg_var}
     for lead in GC_LEADS:
-        ds_rain[f"GC {lead}hr"] = get_gc_var(gc_rain_ds, lead, "daily_rain")
+        ds_rain[f"GC {lead}hr"] = get_gc_var(gc_rain_ds, lead, list(gc_rain_ds.data_vars)[0])
     print("✅ Rainfall loaded.")
 except Exception as e:
     print(f"⚠️ Error loading rainfall: {e}")
@@ -122,38 +130,32 @@ except Exception as e:
 
 # 2. Temperature (T2M)
 try:
-    if os.path.exists(PATHS["ERA5_T2M"]) and os.path.exists(PATHS["GC_T2M"]):
-        era5_t2m = xr.open_zarr(PATHS["ERA5_T2M"])["t2m"]
-        gc_t2m_ds = xr.open_zarr(PATHS["GC_T2M"])
-        ds_t2m = {"OBS": era5_t2m}
-        for lead in GC_LEADS:
-            ds_t2m[f"GC {lead}hr"] = get_gc_var(gc_t2m_ds, lead, "t2m")
-        print("✅ T2M loaded.")
-    else:
-        print("⚠️ T2M datasets not found. Skipping.")
-        ds_t2m = {}
+    era5_t2m = xr.open_zarr(PATHS["ERA5_T2M"])
+    ds_t2m = {"OBS": get_first_var(era5_t2m)}
+    for lead in GC_LEADS:
+        gc_ds = xr.open_zarr(get_gc_path("2m_temperature", lead))
+        ds_t2m[f"GC {lead}hr"] = get_first_var(gc_ds)
+    print("✅ T2M loaded.")
 except Exception as e:
     print(f"⚠️ Error loading T2M: {e}")
     ds_t2m = {}
 
 # 3. Winds (U10, V10)
 try:
-    if os.path.exists(PATHS["ERA5_WIND"]) and os.path.exists(PATHS["GC_WIND"]):
-        era5_wind = xr.open_zarr(PATHS["ERA5_WIND"])
-        gc_wind_ds = xr.open_zarr(PATHS["GC_WIND"])
-        
-        ds_u10 = {"OBS": era5_wind["u10"]}
-        ds_v10 = {"OBS": era5_wind["v10"]}
-        for lead in GC_LEADS:
-            ds_u10[f"GC {lead}hr"] = get_gc_var(gc_wind_ds, lead, "u10")
-            ds_v10[f"GC {lead}hr"] = get_gc_var(gc_wind_ds, lead, "v10")
-        print("✅ 10m Winds loaded.")
-    else:
-        print("⚠️ Wind datasets not found. Skipping.")
-        ds_u10, ds_v10 = {}, {}
+    era5_u10 = xr.open_zarr(PATHS["ERA5_U10"])
+    era5_v10 = xr.open_zarr(PATHS["ERA5_V10"])
+    
+    ds_u10 = {"OBS": get_first_var(era5_u10)}
+    ds_v10 = {"OBS": get_first_var(era5_v10)}
+    for lead in GC_LEADS:
+        gc_u_ds = xr.open_zarr(get_gc_path("10m_u_component_of_wind", lead))
+        gc_v_ds = xr.open_zarr(get_gc_path("10m_v_component_of_wind", lead))
+        ds_u10[f"GC {lead}hr"] = get_first_var(gc_u_ds)
+        ds_v10[f"GC {lead}hr"] = get_first_var(gc_v_ds)
+    print("✅ 10m Winds loaded.")
 except Exception as e:
     print(f"⚠️ Error loading Winds: {e}")
-    ds_u10, ds_v10 = {}, {}
+    ds_u10, ds_v10 = {}
 
 LABELS = list(ds_rain.keys()) if ds_rain else ["OBS"] + [f"GC {L}hr" for L in GC_LEADS]
 
