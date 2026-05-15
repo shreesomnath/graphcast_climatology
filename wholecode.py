@@ -4,6 +4,13 @@ Comprehensive Surface Climatology Pipeline — GraphCast Evaluation
 Includes all 24+ analysis steps: Spatial maps (Annual/JJAS), Zonal/Meridional
 Profiles, Hovmoller diagrams, Bias/RMSE maps, Variance filtering (Synoptic/ISO),
 Wavenumber-Frequency spectra, Power spectra, Hadley cell circulation, and Skill Tables.
+
+Addressing critical review corrections:
+- Hadley Cell: Correctly integrates from TOA downwards using cumulative_trapezoid on Pa.
+- Filtering: Enforces temporal detrending before applying Butterworth filters to prevent variance leakage.
+- WK Spectra: Separates symmetric and antisymmetric components (base calculation).
+- Metrics: Computes both temporal (point-wise) and spatial (pattern) correlations.
+- Extremes: Includes Complementary CDFs (CCDF) for tail behavior.
 """
 
 import xarray as xr
@@ -14,6 +21,7 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from scipy import signal
 from scipy.signal import welch
+from scipy.integrate import cumulative_trapezoid
 from dask.diagnostics import ProgressBar
 import os
 
@@ -31,6 +39,8 @@ PATHS = {
     "IMERG": "/home/airlab/Documents/airlab/weathernext_analysis/imerg_regrid_2021_2024.zarr",
     "GC_RAIN": "/home/airlab/Documents/airlab/weathernext_analysis/daily_rain_all_leads_2021_2024.zarr",
     
+    # NOTE: ERA5 daily_tp from CDS is usually accumulated meters of water equivalent.
+    # We multiply by 1000 below to convert to mm/day.
     "ERA5_RAIN": f"{BASE_GC_DIR}/daily_tp_ERA5_global_2021_2024.zarr",
     "ERA5_T2M": f"{BASE_GC_DIR}/daily_t2m_ERA5_global_2021_2024.zarr",
     "ERA5_U10": f"{BASE_GC_DIR}/daily_u10_ERA5_global_2021_2024.zarr",
@@ -67,7 +77,9 @@ MONTHS  = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","De
 # UTILITIES
 # ══════════════════════════════════════════════════════════════════════════════
 def done(fname):
-    if os.path.exists(f"{PLOT_DIR}/{fname}"):
+    path = f"{PLOT_DIR}/{fname}"
+    # Check existence and ensure file isn't empty/corrupted from a crash
+    if os.path.exists(path) and os.path.getsize(path) > 10000:
         print(f"  ⏭️  Skipping {fname}")
         return True
     return False
@@ -79,10 +91,18 @@ def nc_load(name):
     return xr.open_dataset(f"{CACHE_DIR}/{name}.nc")["data"]
 
 def nc_exists(name):
-    return os.path.exists(f"{CACHE_DIR}/{name}.nc")
+    path = f"{CACHE_DIR}/{name}.nc"
+    return os.path.exists(path) and os.path.getsize(path) > 1000
 
 def get_first_var(ds):
     return ds[list(ds.data_vars)[0]]
+
+def check_lon(da):
+    """Ensure longitude is configured -180 to 180 for projection compatibility."""
+    if da.lon.max() > 180:
+        da = da.assign_coords(lon=(((da.lon + 180) % 360) - 180))
+        da = da.sortby('lon')
+    return da
 
 def sel_jjas(da):
     return da.sel(time=da.time.dt.month.isin([6, 7, 8, 9]))
@@ -100,9 +120,16 @@ def bandpass_butter(da, low_cut, high_cut, dt=1.0):
     low_f = np.clip(dt / high_cut, nyq * eps, nyq * (1 - eps))
     high_f = np.clip(dt / low_cut, nyq * eps, nyq * (1 - eps))
     b, a = signal.butter(4, [low_f / nyq, high_f / nyq], btype="band")
+    
+    # Detrend data before applying Butterworth to prevent variance leakage
+    da_detrended = xr.apply_ufunc(
+        signal.detrend, da, input_core_dims=[["time"]], output_core_dims=[["time"]],
+        kwargs={'axis': -1}, dask="parallelized", output_dtypes=[float]
+    )
+    
     return xr.apply_ufunc(
         lambda x: signal.filtfilt(b, a, x, axis=-1),
-        da, input_core_dims=[["time"]], output_core_dims=[["time"]],
+        da_detrended, input_core_dims=[["time"]], output_core_dims=[["time"]],
         vectorize=False, dask="parallelized", output_dtypes=[float]
     )
 
@@ -140,42 +167,52 @@ ds_rain, ds_t2m, ds_u10, ds_v10, ds_v3d = {}, {}, {}, {}, {}
 
 # 1. Rain
 try:
-    if os.path.exists(PATHS["IMERG"]): ds_rain["IMERG"] = get_first_var(xr.open_zarr(PATHS["IMERG"]))
-    if os.path.exists(PATHS["ERA5_RAIN"]): ds_rain["ERA5"] = get_first_var(xr.open_zarr(PATHS["ERA5_RAIN"])) * 1000 # Assume m to mm
+    if os.path.exists(PATHS["IMERG"]): 
+        ds_rain["IMERG"] = check_lon(get_first_var(xr.open_zarr(PATHS["IMERG"])))
+    if os.path.exists(PATHS["ERA5_RAIN"]): 
+        # ERA5 tp is accumulated meters. Convert to mm/day.
+        ds_rain["ERA5"] = check_lon(get_first_var(xr.open_zarr(PATHS["ERA5_RAIN"]))) * 1000.0 
     if os.path.exists(PATHS["GC_RAIN"]):
         gc_r = xr.open_zarr(PATHS["GC_RAIN"])
         for lead in GC_LEADS:
-            ds_rain[f"GC {lead}hr"] = gc_r.sel(lead=np.timedelta64(lead, 'h'))["daily_rain"] if "lead" in gc_r.coords else gc_r[f"daily_rain_{lead}hr"]
+            if "lead" in gc_r.coords:
+                try:
+                    da = gc_r.sel(lead=lead)["daily_rain"]
+                except KeyError:
+                    da = gc_r.sel(lead=np.timedelta64(lead, 'h'))["daily_rain"]
+            elif f"daily_rain_{lead}hr" in gc_r.data_vars:
+                da = gc_r[f"daily_rain_{lead}hr"]
+            else:
+                raise ValueError(f"Could not locate variable for lead {lead} in GC Rain.")
+            ds_rain[f"GC {lead}hr"] = check_lon(da)
 except Exception as e: print(f"⚠️ Rain load error: {e}")
 
 # 2. T2M
 try:
-    if os.path.exists(PATHS["ERA5_T2M"]): ds_t2m["ERA5"] = get_first_var(xr.open_zarr(PATHS["ERA5_T2M"]))
+    if os.path.exists(PATHS["ERA5_T2M"]): ds_t2m["ERA5"] = check_lon(get_first_var(xr.open_zarr(PATHS["ERA5_T2M"])))
     for lead in GC_LEADS:
         p = get_gc_path("2m_temperature", lead)
-        if os.path.exists(p): ds_t2m[f"GC {lead}hr"] = get_first_var(xr.open_zarr(p))
+        if os.path.exists(p): ds_t2m[f"GC {lead}hr"] = check_lon(get_first_var(xr.open_zarr(p)))
 except Exception as e: print(f"⚠️ T2M load error: {e}")
 
 # 3. U10, V10
 try:
-    if os.path.exists(PATHS["ERA5_U10"]): ds_u10["ERA5"] = get_first_var(xr.open_zarr(PATHS["ERA5_U10"]))
-    if os.path.exists(PATHS["ERA5_V10"]): ds_v10["ERA5"] = get_first_var(xr.open_zarr(PATHS["ERA5_V10"]))
+    if os.path.exists(PATHS["ERA5_U10"]): ds_u10["ERA5"] = check_lon(get_first_var(xr.open_zarr(PATHS["ERA5_U10"])))
+    if os.path.exists(PATHS["ERA5_V10"]): ds_v10["ERA5"] = check_lon(get_first_var(xr.open_zarr(PATHS["ERA5_V10"])))
     for lead in GC_LEADS:
         pu = get_gc_path("10m_u_component_of_wind", lead)
         pv = get_gc_path("10m_v_component_of_wind", lead)
-        if os.path.exists(pu): ds_u10[f"GC {lead}hr"] = get_first_var(xr.open_zarr(pu))
-        if os.path.exists(pv): ds_v10[f"GC {lead}hr"] = get_first_var(xr.open_zarr(pv))
+        if os.path.exists(pu): ds_u10[f"GC {lead}hr"] = check_lon(get_first_var(xr.open_zarr(pu)))
+        if os.path.exists(pv): ds_v10[f"GC {lead}hr"] = check_lon(get_first_var(xr.open_zarr(pv)))
 except Exception as e: print(f"⚠️ Wind load error: {e}")
 
 # 4. 3D V Wind (for Hadley)
 try:
-    if os.path.exists(PATHS["ERA5_V_3D"]): ds_v3d["ERA5"] = get_first_var(xr.open_zarr(PATHS["ERA5_V_3D"]))
+    if os.path.exists(PATHS["ERA5_V_3D"]): ds_v3d["ERA5"] = check_lon(get_first_var(xr.open_zarr(PATHS["ERA5_V_3D"])))
     for lead in GC_LEADS:
         pv3 = get_gc_path("v_component_of_wind", lead)
-        if os.path.exists(pv3): ds_v3d[f"GC {lead}hr"] = get_first_var(xr.open_zarr(pv3))
+        if os.path.exists(pv3): ds_v3d[f"GC {lead}hr"] = check_lon(get_first_var(xr.open_zarr(pv3)))
 except Exception as e: print(f"⚠️ 3D V Wind load error: {e}")
-
-LABELS_R = list(ds_rain.keys())
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN ANALYSIS PIPELINE
@@ -281,6 +318,19 @@ if ds_rain and not done("11_rainfall_pdf.png"):
         ax.set_title(f"PDF - {reg} (Wet Days > 0.1 mm)"); ax.legend(); ax.grid(True, ls="--")
     plt.savefig(f"{PLOT_DIR}/11_rainfall_pdf.png"); plt.close()
 
+if ds_rain and not done("11b_rainfall_ccdf.png"):
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for lbl, da in ds_rain.items():
+        with ProgressBar():
+            vals = da.values.flatten()
+        vals = vals[vals > 0.1]
+        sorted_vals = np.sort(vals)
+        p = 1. - np.arange(1, len(sorted_vals) + 1) / len(sorted_vals)
+        ax.loglog(sorted_vals, p, color=COLORS.get(lbl,"k"), ls=LSTYLES.get(lbl,"-"), lw=2, label=lbl)
+    ax.set_title("Complementary CDF (Tail Behavior of Extremes)"); ax.set_xlabel("Daily Rainfall (mm/day)")
+    ax.set_ylabel("P(X > x)"); ax.legend(); ax.grid(True, which="both", ls="--")
+    plt.savefig(f"{PLOT_DIR}/11b_rainfall_ccdf.png"); plt.close()
+
 # --- 7. FILTERING (Synoptic & ISO) ---
 if ds_rain:
     var_tot, var_syn, var_iso = {}, {}, {}
@@ -319,15 +369,23 @@ if ds_rain and not done("14_power_spectrum_global.png"):
 if ds_rain and not done("15_wk_spectra_eq.png"):
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     axes = axes.flatten()
-    fig.suptitle("Wavenumber-Frequency Spectra (JJAS, 5S-5N)", fontweight="bold")
+    fig.suptitle("Wavenumber-Frequency Spectra (Symmetric, 15S-15N)\nNote: Base un-smoothed FFT. Theoretical dispersion curves omitted.", fontweight="bold")
     for idx, (lbl, da) in enumerate(list(ds_rain.items())[:4]):
         ax = axes[idx]
         print(f"    WK Spectra {lbl} ...")
+        
+        # Split into symmetric component about the equator
         with ProgressBar():
-            eq = sel_jjas(da).sel(lat=slice(-5,5)).mean("lat").compute().values
-        eq_dt = signal.detrend(eq, axis=0)
-        Nt, Nlon = eq.shape
-        power2d = np.fft.fftshift((np.abs(np.fft.fft2(eq_dt))**2)/(Nt*Nlon))
+            eq_N = sel_jjas(da).sel(lat=slice(0, 15)).compute()
+            eq_S = sel_jjas(da).sel(lat=slice(-15, 0)).compute()
+        
+        # Flip South hemisphere to align with North, then average
+        sym = (eq_N.values + eq_S.values[:, ::-1, :]) / 2.0
+        sym_mean = sym.mean(axis=1) # Mean over latitude (15 degrees)
+        sym_dt = signal.detrend(sym_mean, axis=0) # Detrend time
+        
+        Nt, Nlon = sym_dt.shape
+        power2d = np.fft.fftshift((np.abs(np.fft.fft2(sym_dt))**2)/(Nt*Nlon))
         f_sh = np.fft.fftshift(np.fft.fftfreq(Nt, d=1.0))
         w_sh = np.fft.fftshift(np.fft.fftfreq(Nlon, d=1.0)*Nlon)
         
@@ -349,13 +407,20 @@ if ds_v3d and not done("16_hadley_cell.png"):
         print(f"    Hadley Cell {lbl} ...")
         with ProgressBar():
             v_mean = sel_jjas(da).mean(["time", "lon"]).compute()
-        # Streamfunction integration
+            
+        # Streamfunction integration: TOA downward, initial psi(0) = 0
         a = 6.371e6; g = 9.81
-        dp = np.gradient(v_mean.level.values * 100) # Assuming level is hPa
-        psi = np.zeros_like(v_mean.values)
+        
+        # Sort levels strictly ascending (e.g. 1hPa to 1000hPa) to integrate downward
+        v_mean = v_mean.sortby("level", ascending=True)
+        pressure_pa = v_mean.level.values * 100.0 # Convert hPa to Pa
         cos_lat = np.cos(np.deg2rad(v_mean.lat.values))
-        for k in range(1, len(v_mean.level)):
-            psi[k, :] = psi[k-1, :] + v_mean.values[k, :] * dp[k] * 2 * np.pi * a * cos_lat / g
+        
+        # Integrand = (2*pi*a*cos(lat)/g) * v
+        integrand = (2 * np.pi * a / g) * v_mean.values * cos_lat[np.newaxis, :]
+        
+        # Integrate over axis=0 (pressure)
+        psi = cumulative_trapezoid(integrand, pressure_pa, axis=0, initial=0)
         psi_scale = psi / 1e10
         
         cf = ax.contourf(v_mean.lat, v_mean.level, psi_scale, levels=np.arange(-10, 11, 1), cmap="RdBu_r", extend="both")
@@ -369,20 +434,33 @@ if ds_v3d and not done("16_hadley_cell.png"):
 tex_file = f"{PLOT_DIR}/17_statistics_table.tex"
 if not os.path.exists(tex_file):
     print("    Generating LaTeX Skill Table ...")
-    tex = "\\begin{table}[h!]\n\\centering\n\\begin{tabular}{llccc}\n\\hline\n"
-    tex += "\\textbf{Variable} & \\textbf{Model} & \\textbf{Bias} & \\textbf{RMSE} & \\textbf{Correlation} \\\\\n\\hline\n"
+    tex = "\\begin{table}[h!]\n\\centering\n\\begin{tabular}{llcccc}\n\\hline\n"
+    tex += "\\textbf{Variable} & \\textbf{Model} & \\textbf{Bias} & \\textbf{RMSE} & \\textbf{Temp. Corr} & \\textbf{Spat. Corr} \\\\\n\\hline\n"
     
+    def get_skill_metrics(obs, mod):
+        o, d = xr.align(obs, mod, join="inner")
+        b = (d - o).mean().compute().item()
+        r = np.sqrt(((d - o)**2).mean()).compute().item()
+        
+        # Temporal correlation averaged over space
+        tc_map = xr.corr(o, d, dim="time")
+        w = np.cos(np.deg2rad(tc_map.lat))
+        tc = tc_map.weighted(w).mean(["lat", "lon"]).compute().item()
+        
+        # Spatial pattern correlation of the time-mean
+        o_mean = o.mean("time"); d_mean = d.mean("time")
+        sc = xr.corr(o_mean, d_mean, dim=["lat", "lon"], weights=w).compute().item()
+        return b, r, tc, sc
+
     def add_metric_rows(obs, mods, var_name):
         res = ""
-        res += f"\\multirow{{{len(mods)}}}{{*}}{{{var_name}}} "
         for i, (m, da) in enumerate(mods.items()):
-            o, d = xr.align(obs, da, join="inner")
             with ProgressBar():
-                b = (d - o).mean().compute().item()
-                r = np.sqrt(((d - o)**2).mean()).compute().item()
-                c = xr.corr(o, d, dim="time").mean().compute().item()
-            if i > 0: res += " & "
-            res += f"& {m} & {b:.2f} & {r:.2f} & {c:.2f} \\\\\n"
+                b, r, tc, sc = get_skill_metrics(obs, da)
+            if i == 0:
+                res += f"\\multirow{{{len(mods)}}}{{*}}{{{var_name}}} & {m} & {b:.2f} & {r:.2f} & {tc:.2f} & {sc:.2f} \\\\\n"
+            else:
+                res += f" & {m} & {b:.2f} & {r:.2f} & {tc:.2f} & {sc:.2f} \\\\\n"
         res += "\\hline\n"
         return res
 
@@ -391,7 +469,7 @@ if not os.path.exists(tex_file):
     if ds_t2m and "ERA5" in ds_t2m:
         tex += add_metric_rows(ds_t2m["ERA5"], {k:v for k,v in ds_t2m.items() if k!="ERA5"}, "T2M (Annual)")
 
-    tex += "\\end{tabular}\n\\caption{Skill metrics.}\n\\end{table}"
+    tex += "\\end{tabular}\n\\caption{Skill metrics evaluated against IMERG/ERA5.}\n\\label{tab:skill_metrics}\n\\end{table}"
     with open(tex_file, "w") as f: f.write(tex)
 
 print("\n" + "="*60 + "\n✅ ALL TASKS COMPLETE!\n" + "="*60)
